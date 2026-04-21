@@ -7,16 +7,17 @@ import {
   isValidRoomCode,
   normalizeRoomCode,
 } from "../lib/roomCode";
-import { gameStyles } from "../ui/gameStyles";
 
 const GAME_COLLECTION = "games";
 const MAX_CREATE_ATTEMPTS = 12;
 
-export default function Lobby({ onEnterRoom }) {
+/** @param {{ styles: ReturnType<typeof import("../ui/gameStyles").createGameStyles>; onEnterRoom: (code: string) => void }} props */
+export default function Lobby({ styles, onEnterRoom }) {
   const db = getDb();
   const [joinInput, setJoinInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const c = styles.colors;
 
   const handleHost = async () => {
     if (!db) return;
@@ -67,20 +68,20 @@ export default function Lobby({ onEnterRoom }) {
   };
 
   return (
-    <div style={gameStyles.container}>
-      <header style={gameStyles.header}>
-        <h1 style={gameStyles.title}>Tic-Tac-Toe</h1>
-        <p style={gameStyles.hint}>
-          Private rooms only: share the code with one other player. There is no
-          public game list.
+    <div style={styles.container}>
+      <header style={styles.header}>
+        <h1 style={styles.title}>Tic-Tac-Toe</h1>
+        <p style={styles.hint}>
+          Private rooms: two players lock in as X and O; anyone else with the
+          link can watch. Share the code with your opponent and spectators.
         </p>
       </header>
 
-      <div style={gameStyles.lobbyCard}>
+      <div style={styles.lobbyCard}>
         <button
           type="button"
           style={{
-            ...gameStyles.primaryBtn,
+            ...styles.primaryBtn,
             opacity: busy ? 0.65 : 1,
             cursor: busy ? "wait" : "pointer",
           }}
@@ -89,8 +90,8 @@ export default function Lobby({ onEnterRoom }) {
         >
           Host a game
         </button>
-        <p style={gameStyles.lobbyDivider}>or join with a code</p>
-        <form onSubmit={(ev) => void handleJoin(ev)} style={gameStyles.joinRow}>
+        <p style={styles.lobbyDivider}>or join with a code</p>
+        <form onSubmit={(ev) => void handleJoin(ev)} style={styles.joinRow}>
           <input
             type="text"
             name="room"
@@ -99,14 +100,14 @@ export default function Lobby({ onEnterRoom }) {
             placeholder="ROOM CODE"
             value={joinInput}
             onChange={(ev) => setJoinInput(ev.target.value.toUpperCase())}
-            style={gameStyles.codeInput}
+            style={styles.codeInput}
             maxLength={12}
             disabled={busy}
           />
           <button
             type="submit"
             style={{
-              ...gameStyles.secondaryBtn,
+              ...styles.secondaryBtn,
               opacity: busy ? 0.65 : 1,
               cursor: busy ? "wait" : "pointer",
             }}
@@ -116,7 +117,7 @@ export default function Lobby({ onEnterRoom }) {
           </button>
         </form>
         {error ? (
-          <p style={{ ...gameStyles.hint, color: "#b91c1c", marginTop: "12px" }}>
+          <p style={{ ...styles.hint, color: c.danger, marginTop: "12px" }}>
             {error}
           </p>
         ) : null}

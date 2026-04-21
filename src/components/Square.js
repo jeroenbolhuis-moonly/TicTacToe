@@ -1,16 +1,22 @@
-import { gameStyles } from "../ui/gameStyles";
-
-export default function Square({ value, onClick, isWinningSquare, disabled }) {
+export default function Square({
+  value,
+  onClick,
+  isWinningSquare,
+  disabled,
+  squareBaseStyle,
+  colors,
+}) {
+  const c = colors;
   return (
     <button
       type="button"
       disabled={disabled}
       onClick={onClick}
       style={{
-        ...gameStyles.square,
-        color: value === "X" ? "#3b82f6" : "#ef4444",
-        backgroundColor: isWinningSquare ? "#fefce8" : "#fff",
-        borderColor: isWinningSquare ? "#facc15" : "#e2e8f0",
+        ...squareBaseStyle,
+        color: value === "X" ? c.pieceX : value === "O" ? c.pieceO : c.textMuted,
+        backgroundColor: isWinningSquare ? c.winSquareBg : c.squareBg,
+        borderColor: isWinningSquare ? c.winSquareBorder : c.squareBorder,
         opacity: disabled && !value ? 0.55 : 1,
         cursor: disabled && !value ? "default" : "pointer",
       }}
