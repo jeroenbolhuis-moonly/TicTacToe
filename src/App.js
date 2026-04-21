@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Square from "./components/Square";
 import Lobby from "./components/Lobby";
 import MoveHistoryThumbnail from "./components/MoveHistoryThumbnail";
@@ -11,6 +11,7 @@ import { placementAtMove } from "./lib/placementAtMove";
 import { createGameStyles } from "./ui/gameStyles";
 
 const ROOM_STORAGE_KEY = "ttt-private-room-code";
+const COPY_ACK_MS = 1600;
 
 function readStoredRoomCode() {
   try {
@@ -31,30 +32,122 @@ function persistRoomCode(code) {
   }
 }
 
-function buildStatus({
+/** Match finished — single headline (no separate “Match over”). */
+function buildEndgameHeadline({
   matchEnded,
   endedReason,
   matchWinner,
   winner,
-  isDraw,
+  myRole,
+  isSpectator,
+}) {
+  if (!matchEnded) return null;
+
+  if (matchWinner === "draw") {
+    return endedReason === "disconnect"
+      ? "Draw — both players disconnected"
+      : "Draw";
+  }
+
+  const neutral = () => {
+    if (winner === "X" || winner === "O") {
+      if (endedReason === "forfeit") return `${winner} wins — opponent left`;
+      if (endedReason === "disconnect")
+        return `${winner} wins — opponent disconnected`;
+      return `${winner} wins`;
+    }
+    return "Game over";
+  };
+
+  if (isSpectator || !myRole) return neutral();
+
+  const iWon = winner === myRole;
+  const iLost = Boolean(winner && winner !== myRole);
+
+  if (iWon) {
+    if (endedReason === "forfeit") return "You win — opponent left the game";
+    if (endedReason === "disconnect")
+      return "You win — opponent disconnected";
+    return "You win";
+  }
+  if (iLost) {
+    if (endedReason === "forfeit") return "You left — opponent wins";
+    if (endedReason === "disconnect")
+      return "You lost — you were disconnected";
+    return "You lost";
+  }
+
+  return neutral();
+}
+
+/**
+ * @returns {{ primary: string; secondary: string | null; tone: 'accent' | 'success' | 'muted' | 'danger' }}
+ */
+function getHeaderPresentation({
+  matchEnded,
+  endedReason,
+  matchWinner,
+  winner,
   xIsNext,
+  myRole,
+  isSpectator,
+  bothRosterFilled,
+  canPlay,
 }) {
   if (matchEnded) {
-    if (matchWinner === "draw") {
-      return endedReason === "disconnect"
-        ? "Draw — both players disconnected"
-        : "Draw";
-    }
-    if (winner) {
-      if (endedReason === "forfeit") return `Winner: ${winner} (opponent left)`;
-      if (endedReason === "disconnect")
-        return `Winner: ${winner} (opponent disconnected)`;
-      return `Winner: ${winner}`;
-    }
+    const primary = buildEndgameHeadline({
+      matchEnded,
+      endedReason,
+      matchWinner,
+      winner,
+      myRole,
+      isSpectator,
+    });
+    const secondary = isSpectator
+      ? "Spectating — this match has ended."
+      : null;
+    const iWon = myRole && winner === myRole && matchWinner !== "draw";
+    const iLost = myRole && winner && winner !== myRole;
+    const tone = matchWinner === "draw"
+      ? "muted"
+      : iWon
+        ? "success"
+        : iLost
+          ? "danger"
+          : "muted";
+    return { primary: primary ?? "Game over", secondary, tone };
   }
-  if (isDraw) return "Draw";
-  if (winner) return `Winner: ${winner}`;
-  return `Next: ${xIsNext ? "X" : "O"}`;
+
+  if (isSpectator) {
+    const mover = xIsNext ? "X" : "O";
+    return {
+      primary: `${mover} to move`,
+      secondary: "You’re spectating — only the two seated players can move.",
+      tone: "muted",
+    };
+  }
+
+  if (!myRole) {
+    return {
+      primary: "Claiming a seat…",
+      secondary: "Hang on while we reserve your spot.",
+      tone: "muted",
+    };
+  }
+
+  if (!bothRosterFilled) {
+    return {
+      primary: "Waiting for opponent",
+      secondary: "Share the room code so someone can take the other seat.",
+      tone: "muted",
+    };
+  }
+
+  if (canPlay) {
+    return { primary: "Your turn", secondary: null, tone: "accent" };
+  }
+
+  return { primary: "Opponent’s turn", secondary: null, tone: "muted" };
 }
 
 /** @param {{ styles: ReturnType<typeof createGameStyles> }} props */
@@ -129,6 +222,8 @@ function MultiplayerApp({ styles }) {
 function GameScreen({ styles, roomCode, onLeaveRoom }) {
   const c = styles.colors;
   const [spectatorViewMove, setSpectatorViewMove] = useState(null);
+  const [roomCopied, setRoomCopied] = useState(false);
+  const copyAckTimerRef = useRef(null);
 
   const {
     loading,
@@ -141,7 +236,6 @@ function GameScreen({ styles, roomCode, onLeaveRoom }) {
     currentSquares,
     winner,
     winningLine,
-    isDraw,
     xIsNext,
     myRole,
     isSpectator,
@@ -153,11 +247,29 @@ function GameScreen({ styles, roomCode, onLeaveRoom }) {
     matchEnded,
     matchWinner,
     endedReason,
+    bothRosterFilled,
   } = useSharedGame(roomCode);
 
   useEffect(() => {
     setSpectatorViewMove(null);
   }, [roomCode, historyBoards.length, currentMove, isSpectator]);
+
+  useEffect(() => {
+    setRoomCopied(false);
+    if (copyAckTimerRef.current != null) {
+      window.clearTimeout(copyAckTimerRef.current);
+      copyAckTimerRef.current = null;
+    }
+  }, [roomCode]);
+
+  useEffect(() => {
+    return () => {
+      if (copyAckTimerRef.current != null) {
+        window.clearTimeout(copyAckTimerRef.current);
+        copyAckTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const effectiveMove =
     isSpectator && spectatorViewMove != null
@@ -172,32 +284,26 @@ function GameScreen({ styles, roomCode, onLeaveRoom }) {
     ? calculateWinner(displaySquares)?.line
     : winningLine;
 
-  const status = buildStatus({
+  const header = getHeaderPresentation({
     matchEnded,
     endedReason,
     matchWinner,
     winner,
-    isDraw,
     xIsNext,
+    myRole,
+    isSpectator,
+    bothRosterFilled,
+    canPlay,
   });
 
-  const roleLine = matchEnded
-    ? isSpectator
-      ? "Match over — you are watching as a spectator."
-      : myRole
-        ? "Match over."
-        : "Match over — you are watching as a spectator."
-    : isSpectator
-      ? "You are watching — two players are seated; seats stay locked."
-      : myRole
-        ? `You are ${myRole}`
-        : "Claiming a seat…";
-
-  const statusColor = winner || (matchEnded && matchWinner && matchWinner !== "draw")
-    ? c.statusSuccess
-    : isDraw
-      ? c.textMuted
-      : c.textMuted;
+  const headlineColor =
+    header.tone === "accent"
+      ? c.accent
+      : header.tone === "success"
+        ? c.statusSuccess
+        : header.tone === "danger"
+          ? c.danger
+          : c.textMuted;
 
   const handleLeave = async () => {
     await releaseSeat();
@@ -207,6 +313,14 @@ function GameScreen({ styles, roomCode, onLeaveRoom }) {
   const copyCode = async () => {
     try {
       await navigator.clipboard.writeText(roomCode);
+      setRoomCopied(true);
+      if (copyAckTimerRef.current != null) {
+        window.clearTimeout(copyAckTimerRef.current);
+      }
+      copyAckTimerRef.current = window.setTimeout(() => {
+        setRoomCopied(false);
+        copyAckTimerRef.current = null;
+      }, COPY_ACK_MS);
     } catch {
       /* ignore */
     }
@@ -260,27 +374,78 @@ function GameScreen({ styles, roomCode, onLeaveRoom }) {
     <div style={styles.container}>
       <header style={styles.header}>
         <h1 style={styles.title}>Tic-Tac-Toe</h1>
-        <div style={styles.roomPill}>
-          <span>Room</span>
-          <span aria-label="Room code">{roomCode}</span>
+
+        <div style={styles.headerToolbar}>
+          <div style={styles.roomPill}>
+            <span style={styles.roomPillLabel}>Room</span>
+            <div style={styles.roomPillCodeRow}>
+              <span style={styles.roomPillCode} aria-label="Room code">
+                {roomCode}
+              </span>
+              <button
+                type="button"
+                className="room-copy-btn"
+                style={styles.roomCopyIconBtn}
+                aria-label="Copy room code"
+                title="Copy room code"
+                onClick={() => void copyCode()}
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                  aria-hidden
+                >
+                  <rect
+                    x="9"
+                    y="9"
+                    width="13"
+                    height="13"
+                    rx="2"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  />
+                  <path
+                    d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              {roomCopied ? (
+                <span
+                  role="status"
+                  aria-live="polite"
+                  style={styles.roomCopyFeedback}
+                >
+                  Copied!
+                </span>
+              ) : null}
+            </div>
+          </div>
+          <button
+            type="button"
+            style={styles.toolbarBtnDanger}
+            onClick={() => void handleLeave()}
+          >
+            Leave room
+          </button>
         </div>
-        <button type="button" style={styles.textBtn} onClick={() => void copyCode()}>
-          Copy room code
-        </button>
-        <button type="button" style={styles.textBtn} onClick={() => void handleLeave()}>
-          Leave room
-        </button>
-        <div
-          style={{
-            ...styles.status,
-            color: statusColor,
-          }}
-        >
-          {status}
-        </div>
-        <p style={styles.hint}>{roleLine}</p>
+
+        <p style={{ ...styles.headline, color: headlineColor }}>{header.primary}</p>
+        {header.secondary ? (
+          <p style={{ ...styles.hint, marginTop: "8px", marginBottom: 0 }}>
+            {header.secondary}
+          </p>
+        ) : null}
         {writeError ? (
-          <p style={{ ...styles.hint, color: c.danger }}>{writeError}</p>
+          <p style={{ ...styles.hint, color: c.danger, marginTop: "10px" }}>
+            {writeError}
+          </p>
         ) : null}
       </header>
 
