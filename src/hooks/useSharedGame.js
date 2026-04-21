@@ -7,8 +7,11 @@ import { calculateWinner, xIsNextForMove } from "../game/logic";
 import { getOrCreateClientId } from "../lib/clientId";
 
 const GAME_COLLECTION = "games";
-const SEAT_STALE_MS = 45_000;
-const HEARTBEAT_MS = 12_000;
+/** Stale ping before an *unfilled* seat is considered free (pre‑roster). */
+const LOBBY_STALE_MS = 45_000;
+/** If a seated player’s ping is older than this while both are assigned, they forfeit. */
+const MATCH_DISCONNECT_MS = 16_000;
+const HEARTBEAT_MS = 4000;
 
 export const initialGamePayload = () => ({
   history: [EMPTY_BOARD_STRING],
@@ -17,6 +20,9 @@ export const initialGamePayload = () => ({
   oPlayer: null,
   xPingAt: null,
   oPingAt: null,
+  matchEnded: false,
+  matchWinner: null,
+  endedReason: null,
 });
 
 function normalizeRemote(raw) {
@@ -34,24 +40,31 @@ function normalizeRemote(raw) {
     oPlayer: raw?.oPlayer ?? null,
     xPingAt: typeof raw?.xPingAt === "number" ? raw.xPingAt : null,
     oPingAt: typeof raw?.oPingAt === "number" ? raw.oPingAt : null,
+    matchEnded: Boolean(raw?.matchEnded),
+    matchWinner: raw?.matchWinner ?? null,
+    endedReason: raw?.endedReason ?? null,
   };
 }
 
-function seatIsLive(pingAt) {
+function seatIsLive(pingAt, maxAgeMs = LOBBY_STALE_MS) {
   if (typeof pingAt !== "number" || Number.isNaN(pingAt)) return false;
-  return Date.now() - pingAt < SEAT_STALE_MS;
+  return Date.now() - pingAt < maxAgeMs;
 }
 
-/** @typedef {{ kind: 'play' | 'nav' | 'reset'; history: string[]; currentMove: number }} PendingOverlay */
+/** @typedef {{ kind: 'play' | 'nav' | 'reset'; history: string[]; currentMove: number; matchEnded?: boolean; matchWinner?: string | null; endedReason?: string | null }} PendingOverlay */
 
 function mergeWithPending(base, pending) {
   if (!base) return null;
   if (!pending) return base;
-  return {
+  const merged = {
     ...base,
     history: pending.history,
     currentMove: pending.currentMove,
   };
+  if (pending.matchEnded !== undefined) merged.matchEnded = pending.matchEnded;
+  if (pending.matchWinner !== undefined) merged.matchWinner = pending.matchWinner;
+  if (pending.endedReason !== undefined) merged.endedReason = pending.endedReason;
+  return merged;
 }
 
 /**
@@ -61,6 +74,15 @@ function mergeWithPending(base, pending) {
 function isPendingSatisfied(remoteNorm, p) {
   if (!p) return true;
   if (!remoteNorm) return false;
+
+  if (p.matchEnded !== undefined) {
+    if (remoteNorm.matchEnded !== p.matchEnded) return false;
+    if (p.matchEnded) {
+      if (remoteNorm.matchWinner !== p.matchWinner) return false;
+      if (remoteNorm.endedReason !== p.endedReason) return false;
+    }
+  }
+
   const lenR = remoteNorm.history.length;
   const lenP = p.history.length;
   const prefixMatch =
@@ -107,14 +129,15 @@ export function useSharedGame(roomCode) {
     return remote.history.map(boardFromString);
   }, [remote]);
 
+  const historyStrings = remote?.history ?? [];
+
   const currentSquares =
     historyBoards[remote?.currentMove ?? 0] ?? Array(9).fill(null);
   const xIsNext = xIsNextForMove(remote?.currentMove ?? 0);
 
-  const xSeatLive =
-    Boolean(remote?.xPlayer) && seatIsLive(remote?.xPingAt ?? null);
-  const oSeatLive =
-    Boolean(remote?.oPlayer) && seatIsLive(remote?.oPingAt ?? null);
+  const bothRosterFilled = Boolean(remote?.xPlayer && remote?.oPlayer);
+  const xSeatLiveLobby = Boolean(remote?.xPlayer) && seatIsLive(remote?.xPingAt ?? null, LOBBY_STALE_MS);
+  const oSeatLiveLobby = Boolean(remote?.oPlayer) && seatIsLive(remote?.oPingAt ?? null, LOBBY_STALE_MS);
 
   const myRole = useMemo(() => {
     if (!remote) return null;
@@ -123,9 +146,7 @@ export function useSharedGame(roomCode) {
     return null;
   }, [remote, clientId]);
 
-  const seatFull = Boolean(
-    remote && xSeatLive && oSeatLive && !myRole
-  );
+  const isSpectator = Boolean(bothRosterFilled && !myRole);
 
   useEffect(() => {
     claimStarted.current = false;
@@ -172,7 +193,7 @@ export function useSharedGame(roomCode) {
   useEffect(() => {
     if (!db || !remote || !roomCode || claimStarted.current) return;
     if (myRole) return;
-    if (seatFull) return;
+    if (bothRosterFilled) return;
 
     claimStarted.current = true;
     const ref = doc(db, GAME_COLLECTION, roomCode);
@@ -184,13 +205,15 @@ export function useSharedGame(roomCode) {
       const d = normalizeRemote(snap.data());
       if (!d) return;
 
+      if (d.xPlayer && d.oPlayer) return;
+
       const x = d.xPlayer ?? null;
       const o = d.oPlayer ?? null;
-      const xLive = Boolean(x) && seatIsLive(d.xPingAt);
-      const oLive = Boolean(o) && seatIsLive(d.oPingAt);
+      const xLive = Boolean(x) && seatIsLive(d.xPingAt, LOBBY_STALE_MS);
+      const oLive = Boolean(o) && seatIsLive(d.oPingAt, LOBBY_STALE_MS);
 
       if (x === clientId || o === clientId) return;
-      if (xLive && oLive) return;
+      if (x && o) return;
 
       if (!xLive) {
         transaction.update(ref, { xPlayer: clientId, xPingAt: now });
@@ -202,10 +225,10 @@ export function useSharedGame(roomCode) {
     }).catch(() => {
       claimStarted.current = false;
     });
-  }, [db, remote, myRole, seatFull, clientId, roomCode]);
+  }, [db, remote, myRole, bothRosterFilled, clientId, roomCode]);
 
   useEffect(() => {
-    if (!db || !roomCode || !myRole) return undefined;
+    if (!db || !roomCode || !myRole || remote?.matchEnded) return undefined;
     const ref = doc(db, GAME_COLLECTION, roomCode);
     const field = myRole === "X" ? "xPingAt" : "oPingAt";
 
@@ -216,18 +239,89 @@ export function useSharedGame(roomCode) {
     ping();
     const id = window.setInterval(ping, HEARTBEAT_MS);
     return () => window.clearInterval(id);
-  }, [db, roomCode, myRole]);
+  }, [db, roomCode, myRole, remote?.matchEnded]);
 
-  const result = calculateWinner(currentSquares);
-  const winner = result?.winner;
-  const isDraw = !winner && currentSquares.every(Boolean);
+  useEffect(() => {
+    if (!db || !roomCode) return undefined;
+    const ref = doc(db, GAME_COLLECTION, roomCode);
+
+    const tick = () => {
+      const d = latestServerRef.current;
+      if (!d?.xPlayer || !d?.oPlayer || d.matchEnded) return;
+      const xLive = seatIsLive(d.xPingAt, MATCH_DISCONNECT_MS);
+      const oLive = seatIsLive(d.oPingAt, MATCH_DISCONNECT_MS);
+      if (xLive && oLive) return;
+
+      void runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(ref);
+        if (!snap.exists()) return;
+        const cur = normalizeRemote(snap.data());
+        if (!cur || cur.matchEnded) return;
+        if (!cur.xPlayer || !cur.oPlayer) return;
+
+        const xl = seatIsLive(cur.xPingAt, MATCH_DISCONNECT_MS);
+        const ol = seatIsLive(cur.oPingAt, MATCH_DISCONNECT_MS);
+        if (xl && ol) return;
+
+        if (!xl && !ol) {
+          transaction.update(ref, {
+            matchEnded: true,
+            matchWinner: "draw",
+            endedReason: "disconnect",
+          });
+          return;
+        }
+        if (!xl) {
+          transaction.update(ref, {
+            matchEnded: true,
+            matchWinner: "O",
+            endedReason: "disconnect",
+          });
+          return;
+        }
+        if (!ol) {
+          transaction.update(ref, {
+            matchEnded: true,
+            matchWinner: "X",
+            endedReason: "disconnect",
+          });
+        }
+      }).catch(() => {});
+    };
+
+    const id = window.setInterval(tick, 1500);
+    return () => window.clearInterval(id);
+  }, [db, roomCode]);
+
+  const boardResult = calculateWinner(currentSquares);
+  const boardWinner = boardResult?.winner;
+  const boardIsDraw = !boardWinner && currentSquares.every(Boolean);
+
+  const matchEnded = Boolean(remote?.matchEnded);
+  const matchWinner = remote?.matchWinner ?? null;
+  const endedReason = remote?.endedReason ?? null;
+
+  const winner = matchEnded
+    ? matchWinner === "X" || matchWinner === "O"
+      ? matchWinner
+      : null
+    : boardWinner;
+
+  const isDraw = matchEnded
+    ? matchWinner === "draw"
+    : boardIsDraw;
 
   const isMyTurn =
     myRole &&
     ((myRole === "X" && xIsNext) || (myRole === "O" && !xIsNext));
 
   const canPlay =
-    Boolean(myRole) && isMyTurn && !winner && Boolean(remote);
+    Boolean(myRole) &&
+    !isSpectator &&
+    !matchEnded &&
+    isMyTurn &&
+    !boardWinner &&
+    Boolean(remote);
 
   const play = useCallback(
     async (index) => {
@@ -236,15 +330,15 @@ export function useSharedGame(roomCode) {
       if (!canPlay || currentSquares[index]) return;
 
       const d = latestServerRef.current;
-      if (!d) return;
+      if (!d || d.matchEnded) return;
 
       const squares = boardFromString(d.history[d.currentMove]);
       const turn = xIsNextForMove(d.currentMove);
       const expected = turn ? "X" : "O";
       if (myRole !== expected) return;
 
-      const w = calculateWinner(squares)?.winner;
-      if (w || squares[index]) return;
+      const w0 = calculateWinner(squares)?.winner;
+      if (w0 || squares[index]) return;
 
       const next = squares.slice();
       next[index] = expected;
@@ -254,38 +348,57 @@ export function useSharedGame(roomCode) {
       ];
       const nextMove = nextHist.length - 1;
 
-      overlayLock.current = true;
-      setWriteError(null);
-      setPending({
+      const nw = calculateWinner(next)?.winner;
+      const nd = !nw && next.every((cell) => Boolean(cell));
+
+      /** @type {PendingOverlay} */
+      const optimistic = {
         kind: "play",
         history: nextHist,
         currentMove: nextMove,
-      });
+      };
+      if (nw) {
+        optimistic.matchEnded = true;
+        optimistic.matchWinner = nw;
+        optimistic.endedReason = "board";
+      } else if (nd) {
+        optimistic.matchEnded = true;
+        optimistic.matchWinner = "draw";
+        optimistic.endedReason = "draw";
+      }
+
+      overlayLock.current = true;
+      setWriteError(null);
+      setPending(optimistic);
 
       const ref = doc(db, GAME_COLLECTION, roomCode);
+      const patch = {
+        history: nextHist,
+        currentMove: nextMove,
+      };
+      if (nw) {
+        patch.matchEnded = true;
+        patch.matchWinner = nw;
+        patch.endedReason = "board";
+      } else if (nd) {
+        patch.matchEnded = true;
+        patch.matchWinner = "draw";
+        patch.endedReason = "draw";
+      }
+
       try {
-        await updateDoc(ref, {
-          history: nextHist,
-          currentMove: nextMove,
-        });
+        await updateDoc(ref, patch);
       } catch (e) {
         setPending(null);
         setWriteError(e.message || "Move failed");
       }
     },
-    [
-      db,
-      roomCode,
-      myRole,
-      canPlay,
-      currentSquares,
-      pending,
-    ]
+    [db, roomCode, myRole, canPlay, currentSquares, pending]
   );
 
   const goToMove = useCallback(
     async (moveIndex) => {
-      if (!db || !myRole || !roomCode) return;
+      if (!db || !myRole || !roomCode || isSpectator) return;
       if (overlayLock.current || pending) return;
       const d = latestServerRef.current;
       if (!d) return;
@@ -307,11 +420,11 @@ export function useSharedGame(roomCode) {
         setWriteError(e.message || "Could not jump in history");
       }
     },
-    [db, myRole, roomCode, pending]
+    [db, myRole, roomCode, pending, isSpectator]
   );
 
   const reset = useCallback(async () => {
-    if (!db || !myRole || !roomCode) return;
+    if (!db || !myRole || !roomCode || isSpectator) return;
     if (overlayLock.current || pending) return;
 
     const nextHist = [EMPTY_BOARD_STRING];
@@ -321,6 +434,9 @@ export function useSharedGame(roomCode) {
       kind: "reset",
       history: nextHist,
       currentMove: 0,
+      matchEnded: false,
+      matchWinner: null,
+      endedReason: null,
     });
 
     const ref = doc(db, GAME_COLLECTION, roomCode);
@@ -328,16 +444,36 @@ export function useSharedGame(roomCode) {
       await updateDoc(ref, {
         history: nextHist,
         currentMove: 0,
+        matchEnded: false,
+        matchWinner: null,
+        endedReason: null,
       });
     } catch (e) {
       setPending(null);
       setWriteError(e.message || "Reset failed");
     }
-  }, [db, myRole, roomCode, pending]);
+  }, [db, myRole, roomCode, pending, isSpectator]);
 
   const releaseSeat = useCallback(async () => {
     if (!db || !roomCode || !myRole) return;
     const ref = doc(db, GAME_COLLECTION, roomCode);
+    const d = latestServerRef.current;
+    const bothSeated = Boolean(d?.xPlayer && d?.oPlayer);
+
+    if (bothSeated && !d?.matchEnded) {
+      const other = myRole === "X" ? "O" : "X";
+      try {
+        await updateDoc(ref, {
+          matchEnded: true,
+          matchWinner: other,
+          endedReason: "forfeit",
+        });
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+
     const patch =
       myRole === "X"
         ? { xPlayer: null, xPingAt: null }
@@ -364,18 +500,23 @@ export function useSharedGame(roomCode) {
     roomMissing,
     roomCode,
     historyBoards,
+    historyStrings,
     currentMove: remote?.currentMove ?? 0,
     currentSquares,
     xIsNext,
     winner,
-    winningLine: result?.line,
+    winningLine: boardResult?.line ?? null,
     isDraw,
     myRole,
-    seatFull,
+    isSpectator,
+    bothRosterFilled,
     canPlay,
     play,
     goToMove,
     reset,
     releaseSeat,
+    matchEnded,
+    matchWinner,
+    endedReason,
   };
 }
