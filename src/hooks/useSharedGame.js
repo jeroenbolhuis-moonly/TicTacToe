@@ -1,10 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  doc,
-  onSnapshot,
-  runTransaction,
-  updateDoc,
-} from "firebase/firestore";
+import { doc, onSnapshot, runTransaction, updateDoc } from "firebase/firestore";
 import { getDb } from "../firebase";
 import { boardFromString, stringFromBoard } from "../game/boardCodec";
 import { EMPTY_BOARD_STRING } from "../game/constants";
@@ -47,6 +42,42 @@ function seatIsLive(pingAt) {
   return Date.now() - pingAt < SEAT_STALE_MS;
 }
 
+/** @typedef {{ kind: 'play' | 'nav' | 'reset'; history: string[]; currentMove: number }} PendingOverlay */
+
+function mergeWithPending(base, pending) {
+  if (!base) return null;
+  if (!pending) return base;
+  return {
+    ...base,
+    history: pending.history,
+    currentMove: pending.currentMove,
+  };
+}
+
+/**
+ * @param {ReturnType<typeof normalizeRemote> | null} remoteNorm
+ * @param {PendingOverlay | null} p
+ */
+function isPendingSatisfied(remoteNorm, p) {
+  if (!p) return true;
+  if (!remoteNorm) return false;
+  const lenR = remoteNorm.history.length;
+  const lenP = p.history.length;
+  const prefixMatch =
+    lenP <= lenR && p.history.every((v, i) => remoteNorm.history[i] === v);
+
+  if (lenR > lenP) {
+    if (p.kind === "reset") return false;
+    if (p.kind === "play" && prefixMatch) return true;
+    if (p.kind === "nav") return true;
+    return false;
+  }
+  if (lenR < lenP) return false;
+  const histEq = remoteNorm.history.every((h, i) => h === p.history[i]);
+  if (!histEq) return true;
+  return remoteNorm.currentMove === p.currentMove;
+}
+
 /**
  * @param {string | null} roomCode Firestore document id for this private lobby
  */
@@ -54,12 +85,22 @@ export function useSharedGame(roomCode) {
   const db = getDb();
   const clientId = useMemo(() => getOrCreateClientId(), []);
   const [raw, setRaw] = useState(null);
+  const [pending, setPending] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [writeError, setWriteError] = useState(null);
   const [roomMissing, setRoomMissing] = useState(false);
   const claimStarted = useRef(false);
+  const latestServerRef = useRef(null);
+  const overlayLock = useRef(false);
 
-  const remote = raw ? normalizeRemote(raw) : null;
+  useEffect(() => {
+    if (!pending) overlayLock.current = false;
+  }, [pending]);
+
+  const remote = useMemo(() => {
+    const base = raw ? normalizeRemote(raw) : null;
+    return mergeWithPending(base, pending);
+  }, [raw, pending]);
 
   const historyBoards = useMemo(() => {
     if (!remote) return [];
@@ -95,19 +136,31 @@ export function useSharedGame(roomCode) {
 
     setRoomMissing(false);
     setRaw(null);
+    setPending(null);
     setLoadError(null);
+    latestServerRef.current = null;
 
     const ref = doc(db, GAME_COLLECTION, roomCode);
     const unsub = onSnapshot(
       ref,
+      { includeMetadataChanges: true },
       (snap) => {
         setLoadError(null);
         if (!snap.exists()) {
+          latestServerRef.current = null;
           setRaw(null);
+          setPending(null);
           setRoomMissing(true);
           return;
         }
-        setRaw(snap.data());
+        const data = snap.data();
+        const normalized = normalizeRemote(data);
+        latestServerRef.current = normalized;
+        setRaw(data);
+        setPending((prev) => {
+          if (!prev) return null;
+          return isPendingSatisfied(normalized, prev) ? null : prev;
+        });
       },
       (err) => {
         setLoadError(err.message || "Could not load game");
@@ -178,71 +231,109 @@ export function useSharedGame(roomCode) {
 
   const play = useCallback(
     async (index) => {
-      if (!db || !remote || !roomCode || !canPlay) return;
-      if (currentSquares[index]) return;
+      if (!db || !roomCode || !myRole) return;
+      if (overlayLock.current || pending) return;
+      if (!canPlay || currentSquares[index]) return;
+
+      const d = latestServerRef.current;
+      if (!d) return;
+
+      const squares = boardFromString(d.history[d.currentMove]);
+      const turn = xIsNextForMove(d.currentMove);
+      const expected = turn ? "X" : "O";
+      if (myRole !== expected) return;
+
+      const w = calculateWinner(squares)?.winner;
+      if (w || squares[index]) return;
+
+      const next = squares.slice();
+      next[index] = expected;
+      const nextHist = [
+        ...d.history.slice(0, d.currentMove + 1),
+        stringFromBoard(next),
+      ];
+      const nextMove = nextHist.length - 1;
+
+      overlayLock.current = true;
       setWriteError(null);
+      setPending({
+        kind: "play",
+        history: nextHist,
+        currentMove: nextMove,
+      });
+
       const ref = doc(db, GAME_COLLECTION, roomCode);
       try {
-        await runTransaction(db, async (transaction) => {
-          const snap = await transaction.get(ref);
-          if (!snap.exists()) return;
-          const d = normalizeRemote(snap.data());
-          if (!d) return;
-
-          const squares = boardFromString(d.history[d.currentMove]);
-          const turn = xIsNextForMove(d.currentMove);
-          const expected = turn ? "X" : "O";
-          if (myRole !== expected) return;
-
-          const w = calculateWinner(squares)?.winner;
-          if (w || squares[index]) return;
-
-          const next = squares.slice();
-          next[index] = expected;
-          const nextHist = [
-            ...d.history.slice(0, d.currentMove + 1),
-            stringFromBoard(next),
-          ];
-          transaction.update(ref, {
-            history: nextHist,
-            currentMove: nextHist.length - 1,
-          });
+        await updateDoc(ref, {
+          history: nextHist,
+          currentMove: nextMove,
         });
       } catch (e) {
+        setPending(null);
         setWriteError(e.message || "Move failed");
       }
     },
-    [db, remote, canPlay, myRole, currentSquares, roomCode]
+    [
+      db,
+      roomCode,
+      myRole,
+      canPlay,
+      currentSquares,
+      pending,
+    ]
   );
 
   const goToMove = useCallback(
     async (moveIndex) => {
-      if (!db || !remote || !myRole || !roomCode) return;
-      if (moveIndex < 0 || moveIndex >= remote.history.length) return;
+      if (!db || !myRole || !roomCode) return;
+      if (overlayLock.current || pending) return;
+      const d = latestServerRef.current;
+      if (!d) return;
+      if (moveIndex < 0 || moveIndex >= d.history.length) return;
+
+      overlayLock.current = true;
       setWriteError(null);
+      setPending({
+        kind: "nav",
+        history: d.history,
+        currentMove: moveIndex,
+      });
+
       const ref = doc(db, GAME_COLLECTION, roomCode);
       try {
         await updateDoc(ref, { currentMove: moveIndex });
       } catch (e) {
+        setPending(null);
         setWriteError(e.message || "Could not jump in history");
       }
     },
-    [db, remote, myRole, roomCode]
+    [db, myRole, roomCode, pending]
   );
 
   const reset = useCallback(async () => {
     if (!db || !myRole || !roomCode) return;
+    if (overlayLock.current || pending) return;
+
+    const nextHist = [EMPTY_BOARD_STRING];
+    overlayLock.current = true;
     setWriteError(null);
+    setPending({
+      kind: "reset",
+      history: nextHist,
+      currentMove: 0,
+    });
+
     const ref = doc(db, GAME_COLLECTION, roomCode);
     try {
       await updateDoc(ref, {
-        history: [EMPTY_BOARD_STRING],
+        history: nextHist,
         currentMove: 0,
       });
     } catch (e) {
+      setPending(null);
       setWriteError(e.message || "Reset failed");
     }
-  }, [db, myRole, roomCode]);
+  }, [db, myRole, roomCode, pending]);
 
   const releaseSeat = useCallback(async () => {
     if (!db || !roomCode || !myRole) return;
