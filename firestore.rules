@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Demo-friendly: tighten before production (e.g. require auth + ownership).
+    match /games/{gameId} {
+      allow read, write: if true;
+    }
+  }
+}
